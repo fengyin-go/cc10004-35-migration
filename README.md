@@ -17,7 +17,9 @@
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/          每个业务模块一组接口
 │   ├── app/services/         业务规则与状态流转
-│   └── app/store.py          内存数据仓库与示例数据
+│   ├── app/db.py             SQLite 持久层（模板、制品元数据、领取与投递记录）
+│   ├── app/services/artifacts.py  制品落盘、提交顺序与重启恢复
+│   └── app/store.py          其余模块的内存数据仓库与示例数据
 ├── .gitignore
 └── docker-compose.yml
 ```
@@ -33,6 +35,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 健康检查：`curl http://127.0.0.1:8000/api/health`
+
+SQLite 与制品默认落在 `backend/data/`（可用 `SQLITE_PATH` /
+`ARTIFACT_STORAGE_DIR` 覆盖）。启动时会自动建表、迁移存量模板并收敛上次中断的制品写入。
 
 ### 前端
 
@@ -74,6 +79,61 @@ npm run dev
   `backend/app/routers/<模块>.py`，业务规则在 `backend/app/services/<模块>.py`。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 报告制品：持久化与恢复
+
+报告模板定义、制品元数据、领取记录与通知投递记录都在 SQLite；制品正文在可配置的
+持久卷（`ARTIFACT_STORAGE_DIR`）。两者分开存放，备份时一起带走即可。
+
+接口（模板接口路径与返回结构保持不变）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/reportgen/{模板id}/artifacts` | 生成并确认制品，必须带 `idempotency_key` |
+| GET | `/api/reportgen/artifacts` | 制品列表，缺文件/损坏的会标记为不可投递 |
+| GET | `/api/reportgen/artifacts/{artifact_id}` | 单条制品元数据 |
+| GET | `/api/reportgen/artifacts/{artifact_id}/download` | 下载已确认制品 |
+| POST | `/api/reportgen/artifacts/{artifact_id}/claim` | 领取已确认制品 |
+| POST | `/api/reportgen/artifacts/reconcile` | 手动触发恢复判定与孤立文件隔离 |
+| POST | `/api/notify/deliveries` | 按制品身份投递通知 |
+| GET | `/api/notify/deliveries` | 查询投递记录 |
+
+一致性策略：
+
+- 提交顺序是「预留元数据 → 写临时文件并 fsync → 标记 staged → 原子改名 → 校验后标记 ready」。
+  只有 `ready` 且摘要/大小都校验通过的制品才出现在 `download_url` 里。
+- 进程在写文件与写元数据之间退出：重启时按元数据里的 sha256/size 校验临时文件，
+  完整则补完提交，不完整则删除并回滚为 `failed`，不会留下可下载的半成品。
+- `ready` 但文件缺失 → `missing`；摘要不符 → 文件移入 `_quarantine` 并转 `corrupt`。
+  两者都不会显示为可投递，下载、领取、通知投递一律拒绝。
+- 没有元数据引用的文件只会被移入隔离区，绝不会自动生成制品记录或公开下载。
+- 同一模板 + 同一确认请求号只受理一次；重放返回第一次的制品身份（`replayed: true`）。
+- 存量模板迁移保留原 id 与模板编号，只迁移模板本身，不伪造任何生成历史。
+- 通知投递的下载地址只使用 `/api/reportgen/artifacts/{artifact_id}/download`，
+  模板名称/编号只作为文案，绝不拼进路径。
+
+容器部署：
+
+```bash
+docker compose up --build
+```
+
+`report-data` 命名卷同时挂载 SQLite 与制品目录；重建容器或重启进程后，已确认的
+制品仍然可以按 `artifact_id` 领取。后端健康检查会返回存储状态与各状态制品数量。
+如果同一卷挂到多个后端副本，启动恢复判定用文件锁串行，后启动的副本会跳过协调。
+可用 `RECONCILE_ON_STARTUP=0` 暂时关闭启动时的自动恢复判定，再通过
+`POST /api/reportgen/artifacts/reconcile` 手动触发。
+
+## 测试
+
+```bash
+cd backend
+.venv/bin/pip install pytest httpx
+.venv/bin/python -m pytest tests -q
+```
+
+测试覆盖迁移、接口兼容、幂等、重启恢复、半成品回滚、缺文件降级、孤立文件隔离、
+按制品身份投递与路径穿越拒绝。
 
 领域：数据工程
 子方向：数据分析与数据应用

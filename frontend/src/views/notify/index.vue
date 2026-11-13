@@ -59,6 +59,58 @@
       <span>共 {{ total }} 条通知分发记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <section class="artifact-panel">
+      <header class="artifact-head">
+        <h3>制品投递记录</h3>
+        <span class="page-desc">跨模块投递按制品身份寻址，下载地址不包含模板名称</span>
+        <span class="page-desc">共 {{ deliveryTotal }} 条</span>
+      </header>
+      <form class="filter-bar" @submit.prevent="deliver">
+        <label class="filter-item">
+          <span>制品编号</span>
+          <input v-model="deliveryForm.artifact_id" placeholder="填写已确认制品的 artifact_id" />
+        </label>
+        <label class="filter-item">
+          <span>通知规则 id</span>
+          <input v-model="deliveryForm.rule_id" placeholder="例如 1" />
+        </label>
+        <label class="filter-item">
+          <span>接收列表</span>
+          <input v-model="deliveryForm.recipients" placeholder="值班组" />
+        </label>
+        <button class="btn primary" type="submit">投递制品</button>
+      </form>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>投递编号</th>
+            <th>制品编号</th>
+            <th>通道</th>
+            <th>状态</th>
+            <th>投递地址</th>
+            <th>投递时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="delivery in deliveries" :key="delivery.delivery_id">
+            <td>{{ delivery.delivery_id }}</td>
+            <td>{{ delivery.artifact_id }}</td>
+            <td>{{ delivery.channel }}</td>
+            <td>{{ delivery.status }}</td>
+            <td>
+              <a class="link" :href="delivery.download_url" target="_blank" rel="noopener">
+                {{ delivery.download_url }}
+              </a>
+            </td>
+            <td>{{ delivery.delivered_at ?? '—' }}</td>
+          </tr>
+          <tr v-if="!deliveries.length">
+            <td colspan="6" class="empty-state">暂无投递记录，可填写制品编号发起投递</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
   </section>
 </template>
 
@@ -69,6 +121,15 @@ import { request } from '@/api/client'
 
 type Row = Record<string, string | number | null>
 
+type Delivery = {
+  delivery_id: number
+  artifact_id: string
+  channel: string
+  status: string
+  download_url: string
+  delivered_at: string | null
+}
+
 const ENDPOINT = '/api/notify'
 const columns = ["规则编号", "触发条件", "通知渠道", "接收列表", "消息模板", "合并窗口秒", "重复抑制", "优先级"]
 const actions = ["提交校验", "启用通知", "停用通知"]
@@ -77,9 +138,55 @@ const stats = [{"label": "通知规则总数", "value": 0}, {"label": "已启用
 
 const rows = ref<Row[]>([])
 const total = ref(0)
+const deliveries = ref<Delivery[]>([])
+const deliveryTotal = ref(0)
+const deliveryForm = ref({ artifact_id: '', rule_id: '', recipients: '' })
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+
+async function deliver() {
+  errorMessage.value = ''
+  const artifactId = deliveryForm.value.artifact_id.trim()
+  if (!artifactId) {
+    errorMessage.value = '请填写制品编号'
+    return
+  }
+  const body: Record<string, unknown> = { artifact_id: artifactId }
+  const ruleId = Number(deliveryForm.value.rule_id)
+  if (deliveryForm.value.rule_id.trim() && Number.isFinite(ruleId)) {
+    body.rule_id = ruleId
+  }
+  if (deliveryForm.value.recipients.trim()) {
+    body.recipients = deliveryForm.value.recipients.trim()
+  }
+  try {
+    const response = await request(`${ENDPOINT}/deliveries`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+    if (!response.ok) {
+      throw new Error('投递未受理：制品可能未确认或文件不可用')
+    }
+    await reloadDeliveries()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '制品投递失败'
+  }
+}
+
+async function reloadDeliveries() {
+  try {
+    const response = await request(`${ENDPOINT}/deliveries?size=50`)
+    if (!response.ok) {
+      throw new Error('投递记录读取失败')
+    }
+    const payload = await response.json()
+    deliveries.value = payload.items ?? []
+    deliveryTotal.value = payload.total ?? deliveries.value.length
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '投递记录读取失败'
+  }
+}
 
 function resetFilters() {
   filters.value = {}
@@ -121,6 +228,7 @@ async function reload() {
     const payload = await response.json()
     rows.value = payload.items ?? []
     total.value = payload.total ?? rows.value.length
+    await reloadDeliveries()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '通知分发列表读取失败'
   }

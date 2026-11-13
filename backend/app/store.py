@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app import db
 from app.seed import SEED_ROWS
 
 
@@ -30,7 +31,12 @@ class Store:
     def overview(self) -> dict[str, object]:
         modules: list[dict[str, object]] = []
         for name in self.module_names():
-            rows = self.rows(name)
+            if name == "reportgen":
+                # 报告模板已经迁到 SQLite，概览必须以持久层为准，避免内存副本给出过期数字。
+                db_items, _total = db.list_templates(page=1, size=10000)
+                rows = db_items
+            else:
+                rows = self.rows(name)
             modules.append({
                 "name": name,
                 "created": len(rows),

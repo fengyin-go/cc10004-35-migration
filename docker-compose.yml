@@ -5,9 +5,27 @@ services:
       - "8000:8000"
     environment:
       - APP_ENV=local
+      # SQLite 元数据与制品正文都放在同一个命名卷，容器重建后仍可领取。
+      - APP_DATA_DIR=/data
+      - SQLITE_PATH=/data/app.sqlite3
+      - ARTIFACT_STORAGE_DIR=/data/artifacts
+    volumes:
+      - report-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
   frontend:
     build: ./frontend
     ports:
       - "5173:5173"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    environment:
+      - VITE_PROXY_TARGET=http://backend:8000
+
+volumes:
+  report-data:

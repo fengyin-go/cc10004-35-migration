@@ -1,11 +1,16 @@
-"""通知分发接口：维护通知规则，覆盖提交校验、启用通知、停用通知等动作。"""
+"""通知分发接口：维护通知规则，覆盖提交校验、启用通知、停用通知等动作。
+
+跨模块投递使用制品身份（artifact_id）寻址，模板名称不参与下载地址；
+投递记录持久化在 SQLite，重启后仍可查询。
+"""
 from __future__ import annotations
 
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.schemas import ActionResult, EntryPayload, PageResult
+from app.schemas import ActionResult, DeliveryPayload, EntryPayload, PageResult
+from app.services import artifacts
 from app.services.notify import NotifyService
 
 router = APIRouter(prefix="/api/notify", tags=["通知分发"])
@@ -14,6 +19,46 @@ service = NotifyService()
 
 LIST_FIELDS = ["规则编号", "触发条件", "通知渠道", "接收列表", "消息模板", "合并窗口秒", "重复抑制", "优先级"]
 STATUSES = ["草稿", "待校验", "已启用", "已停用"]
+
+
+# 静态路径必须先于 /{entry_id} 注册。
+@router.get("/export")
+def export_entries() -> dict[str, Any]:
+    """导出通知分发清单：返回当前过滤条件下的全量数据。"""
+    items, total = service.list_entries(page=1, size=10000)
+    return {"module": "notify", "total": total, "items": items}
+
+
+@router.get("/deliveries", response_model=PageResult[dict])
+def list_deliveries(
+    artifact_id: str | None = Query(default=None, description="按制品身份过滤"),
+    rule_id: int | None = Query(default=None, description="按通知规则过滤"),
+    page: int = 1,
+    size: int = 20,
+) -> PageResult[dict]:
+    """查询通知投递记录；下载地址只引用制品身份。"""
+    if size > 200:
+        raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
+    items, total = service.list_deliveries(
+        artifact_id=artifact_id, rule_id=rule_id, page=page, size=size
+    )
+    return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.post("/deliveries", response_model=dict, status_code=201)
+def deliver_artifact(payload: DeliveryPayload) -> dict:
+    """为已确认制品创建一条通知投递；缺文件、未确认或制品不存在的请求会被拒绝。"""
+    try:
+        return service.deliver(
+            artifact_id=payload.artifact_id,
+            rule_id=payload.rule_id,
+            channel=payload.channel,
+            recipients=payload.recipients,
+            message=payload.message,
+            delivery_key=payload.delivery_key,
+        )
+    except artifacts.ArtifactError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
 
 @router.get("", response_model=PageResult[dict])
@@ -56,10 +101,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出通知分发清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "notify", "total": total, "items": items}

@@ -1,8 +1,16 @@
-"""通知分发业务规则：状态流转、字段校验与筛选口径都收在这里。"""
+"""通知分发业务规则：规则状态流转、通知投递记录与按制品身份的下载地址。
+
+投递记录必须引用已确认制品的 ``artifact_id``；模板名称/模板编号只作为可读文案，
+不能作为下载地址。跨模块调用统一走 ``deliver_artifact``。
+"""
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
+from app import db
+from app.services import artifacts
 from app.store import store
 
 MODULE = "notify"
@@ -59,3 +67,111 @@ class NotifyService:
         entry["pending"] = target != STATUS_ORDER[-1]
         entry["abnormal"] = action in NEGATIVE_ACTIONS
         return entry, f"通知规则已{action}"
+
+    # ---- 制品投递 ---------------------------------------------------------
+    def deliver(
+        self,
+        *,
+        artifact_id: str,
+        rule_id: int | None = None,
+        channel: str | None = None,
+        recipients: str | None = None,
+        message: str | None = None,
+        delivery_key: str | None = None,
+    ) -> dict[str, Any]:
+        """按制品身份投递。制品缺文件/未确认时拒绝，不生成可下载的半成品链接。"""
+        row, _path = artifacts.require_available(artifact_id)
+        sha256 = str(row["sha256"])
+        key = (delivery_key or "").strip() or None
+        if key is None:
+            material = json.dumps(
+                {
+                    "artifact_id": str(row["artifact_id"]),
+                    "artifact_sha256": sha256,
+                    "rule_id": rule_id,
+                    "channel": channel or "",
+                    "recipients": recipients or "",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            key = hashlib.sha256(material.encode("utf-8")).hexdigest()
+        existing = db.find_delivery_by_key(key)
+        if existing is not None:
+            payload = _delivery_payload(existing)
+            payload["replayed"] = True
+            return payload
+
+        resolved_channel = (channel or "").strip() or _rule_channel(rule_id)
+        resolved_message = (message or "").strip() or (
+            f"报告制品 {row['artifact_id']} 已确认可用，请按制品身份领取"
+        )
+        now = db.utc_now()
+        record = {
+            "delivery_key": key,
+            "rule_id": rule_id,
+            "artifact_id": str(row["artifact_id"]),
+            "artifact_sha256": sha256,
+            "channel": resolved_channel,
+            "recipients": recipients,
+            "message": resolved_message,
+            "status": "已投递",
+            "download_url": f"/api/reportgen/artifacts/{row['artifact_id']}/download",
+            "error": None,
+            "created_at": now,
+            "delivered_at": now,
+            "updated_at": now,
+        }
+        try:
+            delivery = db.insert_delivery(record)
+        except Exception:
+            # 并发下唯一键冲突时，返回已经落库的那一条。
+            existing = db.find_delivery_by_key(key)
+            if existing is None:
+                raise
+            payload = _delivery_payload(existing)
+            payload["replayed"] = True
+            return payload
+        payload = _delivery_payload(delivery)
+        payload["replayed"] = False
+        return payload
+
+    def list_deliveries(
+        self,
+        *,
+        artifact_id: str | None = None,
+        rule_id: int | None = None,
+        page: int = 1,
+        size: int = 20,
+    ) -> tuple[list[dict[str, Any]], int]:
+        rows, total = db.list_deliveries(
+            artifact_id=artifact_id, rule_id=rule_id, page=page, size=size
+        )
+        return [_delivery_payload(row) for row in rows], total
+
+
+def _rule_channel(rule_id: int | None) -> str:
+    if rule_id is None:
+        return "站内"
+    rule = store.find(MODULE, rule_id)
+    if rule is None:
+        return "站内"
+    return str(rule.get("通知渠道") or "站内")
+
+
+def _delivery_payload(row: Any) -> dict[str, Any]:
+    return {
+        "delivery_id": int(row["delivery_id"]),
+        "delivery_key": row["delivery_key"],
+        "rule_id": int(row["rule_id"]) if row["rule_id"] is not None else None,
+        "artifact_id": str(row["artifact_id"]),
+        "artifact_sha256": str(row["artifact_sha256"]),
+        "channel": str(row["channel"]),
+        "recipients": row["recipients"],
+        "message": row["message"],
+        "status": str(row["status"]),
+        "download_url": str(row["download_url"]),
+        "error": row["error"],
+        "created_at": row["created_at"],
+        "delivered_at": row["delivered_at"],
+    }

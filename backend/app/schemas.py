@@ -28,6 +28,32 @@ class EntryPayload(BaseModel):
     remark: str | None = None
 
 
+class ArtifactGeneratePayload(BaseModel):
+    """生成并确认一个报告制品；确认请求号用于重复提交只受理一次。"""
+
+    idempotency_key: str = Field(default="", max_length=200)
+    format: str | None = None
+
+
+class ArtifactClaimPayload(BaseModel):
+    """领取已确认制品时的可选回执信息。"""
+
+    claimer: str | None = None
+    channel: str | None = None
+    idempotency_key: str | None = None
+
+
+class DeliveryPayload(BaseModel):
+    """按制品身份投递通知；下载地址由服务端按 artifact_id 生成。"""
+
+    artifact_id: str = Field(min_length=1)
+    rule_id: int | None = None
+    channel: str | None = None
+    recipients: str | None = None
+    message: str | None = None
+    delivery_key: str | None = None
+
+
 
 class QueryEntry(BaseModel):
     """查询语句明细结构。"""
